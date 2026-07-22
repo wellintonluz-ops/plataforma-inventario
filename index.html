@@ -4147,7 +4147,8 @@
             { id: 'u_master_wellinton', nome: 'Wellinton Luz',  email: 'wellinton.luz@grupotbx.com.br',  login: 'wellinton.luz',  senha: 'TrocarSenha@2026' }
         ];
         ADMINS_MASTER.forEach(a => {
-            if (!state.usuarios.find(u => u.email === a.email)) {
+            const existente = state.usuarios.find(u => (u.email || '').toLowerCase() === a.email);
+            if (!existente) {
                 state.usuarios.unshift({
                     id: a.id,
                     nome: a.nome,
@@ -4158,6 +4159,10 @@
                     permissoes: { ...PERMISSOES_PERFIL.adm }
                 });
                 _precisaSalvarUsuarios = true;
+            } else {
+                // Registro já existe (pode ser de uma versão anterior sem login/senha) — repara sem sobrescrever o resto
+                if (!existente.login) { existente.login = a.login; _precisaSalvarUsuarios = true; }
+                if (!existente.senha) { existente.senha = a.senha; _precisaSalvarUsuarios = true; }
             }
         });
         if (_precisaSalvarUsuarios) localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
@@ -4272,7 +4277,8 @@
         function garantirAdminsMaster() {
             let mudou = false;
             ADMINS_MASTER.forEach(a => {
-                if (!state.usuarios.find(u => (u.email || '').toLowerCase() === a.email)) {
+                const existente = state.usuarios.find(u => (u.email || '').toLowerCase() === a.email);
+                if (!existente) {
                     state.usuarios.unshift({
                         id: a.id,
                         nome: a.nome,
@@ -4283,6 +4289,9 @@
                         permissoes: { ...PERMISSOES_PERFIL.adm }
                     });
                     mudou = true;
+                } else {
+                    if (!existente.login) { existente.login = a.login; mudou = true; }
+                    if (!existente.senha) { existente.senha = a.senha; mudou = true; }
                 }
             });
             if (mudou) saveToStorage();
