@@ -4218,15 +4218,21 @@
         }
 
         // ── SINCRONIZAÇÃO COM FIRESTORE ────────────────────────────────────
-        // As funções firestoreCarregarTudo/firestoreSalvarChaves/firestoreObservar
+        // As funções firestoreCarregarTudo/firestoreSalvarChaves/firestoreObservar/
+        // firestoreCarregarTickets/firestoreSalvarTicket/firestoreExcluirTicket/firestoreObservarTickets
         // são expostas em window pelo <script type="module"> no fim do arquivo
         // (ele cuida só da comunicação com o Firebase; aqui é que decidimos o que
         // fazer com os dados, mantendo `state` como a única fonte da verdade em memória).
+        //
+        // IMPORTANTE: 'magaluTickets' NÃO entra nesta lista — cada ticket pode ter fotos em
+        // base64 anexadas (da plataforma e das conversas), então em vez de ficar dentro de
+        // um único documento (limite de 1MB no Firestore, e se estourasse travava a
+        // sincronização de TODO o resto do sistema), cada ticket agora tem seu próprio
+        // documento na coleção `depositoChapas_estado_magaluTickets`.
         const CHAVES_ESTADO_FIRESTORE = [
             'catalog', 'pallets', 'relatorios', 'divergencias', 'usuarios', 'ajustes',
             'inventarios', 'historicoAcoes', 'invAtFisico', 'invAtSistema', 'invAtPendentes',
-            'magaluTickets', 'anotacoes', 'invAtPosicoesDuplicadas', 'rnc',
-            'inspecoesTransferencia', 'treinamentos'
+            'anotacoes', 'invAtPosicoesDuplicadas', 'rnc', 'inspecoesTransferencia', 'treinamentos'
         ];
 
         let _syncFirestoreTimer = null;
@@ -4236,42 +4242,91 @@
             _syncFirestoreTimer = setTimeout(() => {
                 const payload = {};
                 CHAVES_ESTADO_FIRESTORE.forEach(k => { payload[k] = state[k] || []; });
-                window.firestoreSalvarChaves(payload).catch(e => console.error('Erro ao sincronizar com o Firestore:', e));
+                window.firestoreSalvarChaves(payload).catch(e => {
+                    console.error('Erro ao sincronizar com o Firestore:', e);
+                    showToast('Não foi possível salvar na nuvem agora (ficou salvo só neste dispositivo). Verifique a internet e tente de novo.', 'error');
+                });
             }, 700);
         }
 
         async function hidratarEstadoDoFirestore() {
-            if (typeof window.firestoreCarregarTudo !== 'function') return;
-            const nuvem = await window.firestoreCarregarTudo();
-            const faltantes = [];
-            CHAVES_ESTADO_FIRESTORE.forEach(chave => {
-                if (nuvem[chave] && Array.isArray(nuvem[chave].dados)) {
-                    state[chave] = nuvem[chave].dados;
-                } else {
-                    faltantes.push(chave);
+            if (typeof window.firestoreCarregarTudo === 'function') {
+                const nuvem = await window.firestoreCarregarTudo();
+                const faltantes = [];
+                CHAVES_ESTADO_FIRESTORE.forEach(chave => {
+                    if (nuvem[chave] && Array.isArray(nuvem[chave].dados)) {
+                        state[chave] = nuvem[chave].dados;
+                    } else {
+                        faltantes.push(chave);
+                    }
+                });
+                // Chaves que ainda não existem na nuvem: semeia com os dados locais atuais
+                if (faltantes.length > 0) {
+                    const payload = {};
+                    faltantes.forEach(k => { payload[k] = state[k] || []; });
+                    try { await window.firestoreSalvarChaves(payload); } catch (e) { console.error('Erro ao semear Firestore:', e); }
                 }
-            });
-            // Chaves que ainda não existem na nuvem: semeia com os dados locais atuais
-            if (faltantes.length > 0 && typeof window.firestoreSalvarChaves === 'function') {
-                const payload = {};
-                faltantes.forEach(k => { payload[k] = state[k] || []; });
-                try { await window.firestoreSalvarChaves(payload); } catch (e) { console.error('Erro ao semear Firestore:', e); }
+            }
+
+            // Tickets Magalu: um documento por ticket (ver comentário acima)
+            if (typeof window.firestoreCarregarTickets === 'function') {
+                try {
+                    const ticketsNuvem = await window.firestoreCarregarTickets();
+                    if (ticketsNuvem.length > 0) {
+                        state.magaluTickets = ticketsNuvem;
+                    } else if ((state.magaluTickets || []).length > 0) {
+                        // Nuvem vazia mas já existem tickets locais: semeia a nuvem com eles
+                        for (const t of state.magaluTickets) {
+                            try { await window.firestoreSalvarTicket(t); } catch (e) { console.error('Erro ao semear ticket:', t.id, e); }
+                        }
+                    }
+                } catch (e) {
+                    console.error('Erro ao carregar tickets Magalu do Firestore:', e);
+                }
             }
         }
 
-        let _unsubFirestore = null;
-        function iniciarObservacaoFirestore() {
-            if (_unsubFirestore || typeof window.firestoreObservar !== 'function') return;
-            _unsubFirestore = window.firestoreObservar((chave, dados) => {
-                if (!CHAVES_ESTADO_FIRESTORE.includes(chave)) return;
-                state[chave] = dados;
-                localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
-                updateMetrics();
-                renderAll();
+        function sincronizarTicketMagalu(ticket) {
+            if (typeof window.firestoreSalvarTicket !== 'function') return;
+            window.firestoreSalvarTicket(ticket).catch(e => {
+                console.error('Erro ao sincronizar ticket com o Firestore:', e);
+                showToast('Este ticket ficou salvo só neste dispositivo — não sincronizou com a nuvem. Verifique o tamanho das fotos anexadas ou a internet.', 'error');
             });
+        }
+
+        function excluirTicketMagaluDaNuvem(id) {
+            if (typeof window.firestoreExcluirTicket !== 'function') return;
+            window.firestoreExcluirTicket(id).catch(e => console.error('Erro ao excluir ticket na nuvem:', e));
+        }
+
+        let _unsubFirestore = null;
+        let _unsubFirestoreTickets = null;
+        function iniciarObservacaoFirestore() {
+            if (typeof window.firestoreObservar === 'function' && !_unsubFirestore) {
+                _unsubFirestore = window.firestoreObservar((chave, dados) => {
+                    if (!CHAVES_ESTADO_FIRESTORE.includes(chave)) return;
+                    state[chave] = dados;
+                    localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+                    updateMetrics();
+                    renderAll();
+                });
+            }
+            if (typeof window.firestoreObservarTickets === 'function' && !_unsubFirestoreTickets) {
+                _unsubFirestoreTickets = window.firestoreObservarTickets((tipo, ticket, id) => {
+                    if (tipo === 'removido') {
+                        state.magaluTickets = state.magaluTickets.filter(t => String(t.id) !== String(id));
+                    } else {
+                        const idx = state.magaluTickets.findIndex(t => String(t.id) === String(ticket.id));
+                        if (idx !== -1) state.magaluTickets[idx] = ticket; else state.magaluTickets.unshift(ticket);
+                    }
+                    localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+                    if (typeof filtrarTicketsMagalu === 'function') filtrarTicketsMagalu();
+                });
+            }
         }
         function pararObservacaoFirestore() {
             if (_unsubFirestore) { _unsubFirestore(); _unsubFirestore = null; }
+            if (_unsubFirestoreTickets) { _unsubFirestoreTickets(); _unsubFirestoreTickets = null; }
         }
 
         function garantirAdminsMaster() {
@@ -4942,6 +4997,7 @@
             if (!ticket) return;
             ticket.status = ticket.status === 'PAGO' ? 'ABERTO' : 'PAGO';
             saveToStorage();
+            sincronizarTicketMagalu(ticket);
             _renderizarDetalheTicketMagalu(ticket);
             showToast(`Ticket marcado como ${ticket.status}.`, 'success');
         }
@@ -4958,10 +5014,12 @@
 
         function executarConfirmarApagarTicketMagalu() {
             if (!mgtTicketIdParaApagar) return;
-            state.magaluTickets = state.magaluTickets.filter(t => String(t.id).trim() !== String(mgtTicketIdParaApagar).trim());
+            const idApagar = mgtTicketIdParaApagar;
+            state.magaluTickets = state.magaluTickets.filter(t => String(t.id).trim() !== String(idApagar).trim());
             saveToStorage();
+            excluirTicketMagaluDaNuvem(idApagar);
 
-            if (mgtTicketAtivoId !== null && String(mgtTicketAtivoId).trim() === String(mgtTicketIdParaApagar).trim()) {
+            if (mgtTicketAtivoId !== null && String(mgtTicketAtivoId).trim() === String(idApagar).trim()) {
                 voltarParaDashboardMagalu();
             } else {
                 filtrarTicketsMagalu();
@@ -5140,6 +5198,7 @@
                 enviosSalvar.push({ idEnvio: divEnvio.id, numeroEnvio, dataEnvio, skus: skusSalvar });
             }
 
+            let ticketSalvo;
             if (idExistente) {
                 const ticket = state.magaluTickets.find(t => String(t.id).trim() === String(idExistente).trim());
                 if (!ticket) { showToast('Ticket não encontrado.', 'error'); return; }
@@ -5151,9 +5210,10 @@
                 ticket.descricao = descricao;
                 ticket.imagemPlataforma = mgtImagemPlataformaBase64;
                 ticket.envios = enviosSalvar;
+                ticketSalvo = ticket;
                 showToast('Ticket atualizado com sucesso!', 'success');
             } else {
-                state.magaluTickets.unshift({
+                ticketSalvo = {
                     id: 'mgt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
                     cod,
                     data,
@@ -5165,11 +5225,13 @@
                     imagemPlataforma: mgtImagemPlataformaBase64,
                     envios: enviosSalvar,
                     timeline: []
-                });
+                };
+                state.magaluTickets.unshift(ticketSalvo);
                 showToast('Ticket registrado com sucesso!', 'success');
             }
 
             saveToStorage();
+            sincronizarTicketMagalu(ticketSalvo);
             fecharModalFormularioTicketMagalu();
 
             if (mgtTicketAtivoId) {
@@ -5235,6 +5297,7 @@
             });
 
             saveToStorage();
+            sincronizarTicketMagalu(ticket);
             textoEl.value = '';
             removerAnexoInteracaoMagalu();
             renderizarConversaMagalu(ticket);
@@ -5322,6 +5385,7 @@
             msg.texto = novoTexto;
             mgtMensagemIdEmEdicao = null;
             saveToStorage();
+            sincronizarTicketMagalu(ticket);
             renderizarConversaMagalu(ticket);
             showToast('Mensagem atualizada.', 'success');
         }
@@ -5332,6 +5396,7 @@
             if (!confirm('Apagar esta mensagem do histórico?')) return;
             ticket.timeline = (ticket.timeline || []).filter(m => m.id !== id);
             saveToStorage();
+            sincronizarTicketMagalu(ticket);
             renderizarConversaMagalu(ticket);
             showToast('Mensagem apagada.', 'info');
         }
@@ -11060,7 +11125,7 @@
             getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
         } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
         import {
-            getFirestore, collection, doc, getDocs, writeBatch, onSnapshot, serverTimestamp
+            getFirestore, collection, doc, getDocs, writeBatch, onSnapshot, serverTimestamp, setDoc, deleteDoc
         } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 
         const firebaseConfig = {
@@ -11111,6 +11176,38 @@
                     callback(change.doc.id, Array.isArray(data.dados) ? data.dados : []);
                 });
             }, (erro) => console.error('Erro na observação do Firestore:', erro));
+        };
+
+        // ── Tickets Magalu: um documento por ticket (podem ter fotos em base64 anexadas,
+        // então ficam fora do documento único acima para não estourar o limite de 1MB
+        // e não travar a sincronização do resto do sistema) ──
+        const COLECAO_TICKETS = 'depositoChapas_estado_magaluTickets';
+
+        window.firestoreCarregarTickets = async function () {
+            const snap = await getDocs(collection(db, COLECAO_TICKETS));
+            const tickets = [];
+            snap.forEach(d => tickets.push(d.data()));
+            return tickets;
+        };
+
+        window.firestoreSalvarTicket = async function (ticket) {
+            await setDoc(doc(db, COLECAO_TICKETS, String(ticket.id)), { ...ticket, atualizadoEm: serverTimestamp() });
+        };
+
+        window.firestoreExcluirTicket = async function (id) {
+            await deleteDoc(doc(db, COLECAO_TICKETS, String(id)));
+        };
+
+        window.firestoreObservarTickets = function (callback) {
+            return onSnapshot(collection(db, COLECAO_TICKETS), (snapshot) => {
+                snapshot.docChanges().forEach(change => {
+                    if (change.type === 'removed') {
+                        callback('removido', null, change.doc.id);
+                    } else {
+                        callback('atualizado', change.doc.data(), change.doc.id);
+                    }
+                });
+            }, (erro) => console.error('Erro na observação dos tickets Magalu:', erro));
         };
 
         function emailPermitido(email) {
