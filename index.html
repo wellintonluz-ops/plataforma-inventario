@@ -4302,23 +4302,36 @@
         let _unsubFirestore = null;
         let _unsubFirestoreTickets = null;
         function iniciarObservacaoFirestore() {
+            let _primeiraEntregaEstado = true;
+            let _primeiraEntregaTickets = true;
             if (typeof window.firestoreObservar === 'function' && !_unsubFirestore) {
-                _unsubFirestore = window.firestoreObservar((chave, dados) => {
-                    if (!CHAVES_ESTADO_FIRESTORE.includes(chave)) return;
-                    state[chave] = dados;
+                _unsubFirestore = window.firestoreObservar((mudancas) => {
+                    // A primeira entrega do listener repete o que hidratarEstadoDoFirestore()
+                    // já buscou há poucos instantes no login — pula pra não renderizar 2x.
+                    if (_primeiraEntregaEstado) { _primeiraEntregaEstado = false; return; }
+                    let aplicou = false;
+                    Object.keys(mudancas).forEach(chave => {
+                        if (!CHAVES_ESTADO_FIRESTORE.includes(chave)) return;
+                        state[chave] = mudancas[chave];
+                        aplicou = true;
+                    });
+                    if (!aplicou) return;
                     localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
                     updateMetrics();
                     renderAll();
                 });
             }
             if (typeof window.firestoreObservarTickets === 'function' && !_unsubFirestoreTickets) {
-                _unsubFirestoreTickets = window.firestoreObservarTickets((tipo, ticket, id) => {
-                    if (tipo === 'removido') {
-                        state.magaluTickets = state.magaluTickets.filter(t => String(t.id) !== String(id));
-                    } else {
-                        const idx = state.magaluTickets.findIndex(t => String(t.id) === String(ticket.id));
-                        if (idx !== -1) state.magaluTickets[idx] = ticket; else state.magaluTickets.unshift(ticket);
-                    }
+                _unsubFirestoreTickets = window.firestoreObservarTickets((mudancas) => {
+                    if (_primeiraEntregaTickets) { _primeiraEntregaTickets = false; return; }
+                    mudancas.forEach(m => {
+                        if (m.tipo === 'removido') {
+                            state.magaluTickets = state.magaluTickets.filter(t => String(t.id) !== String(m.id));
+                        } else {
+                            const idx = state.magaluTickets.findIndex(t => String(t.id) === String(m.ticket.id));
+                            if (idx !== -1) state.magaluTickets[idx] = m.ticket; else state.magaluTickets.unshift(m.ticket);
+                        }
+                    });
                     localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
                     if (typeof filtrarTicketsMagalu === 'function') filtrarTicketsMagalu();
                 });
@@ -11171,10 +11184,15 @@
 
         window.firestoreObservar = function (callback) {
             return onSnapshot(collection(db, COLECAO_ESTADO), (snapshot) => {
+                if (snapshot.metadata.hasPendingWrites) return; // eco da própria escrita local — já está no state
+                const mudancas = {};
+                let houveMudanca = false;
                 snapshot.docChanges().forEach(change => {
                     const data = change.doc.data();
-                    callback(change.doc.id, Array.isArray(data.dados) ? data.dados : []);
+                    mudancas[change.doc.id] = Array.isArray(data.dados) ? data.dados : [];
+                    houveMudanca = true;
                 });
+                if (houveMudanca) callback(mudancas);
             }, (erro) => console.error('Erro na observação do Firestore:', erro));
         };
 
@@ -11200,13 +11218,16 @@
 
         window.firestoreObservarTickets = function (callback) {
             return onSnapshot(collection(db, COLECAO_TICKETS), (snapshot) => {
+                if (snapshot.metadata.hasPendingWrites) return; // eco da própria escrita local — já está no state
+                const mudancas = [];
                 snapshot.docChanges().forEach(change => {
                     if (change.type === 'removed') {
-                        callback('removido', null, change.doc.id);
+                        mudancas.push({ tipo: 'removido', id: change.doc.id });
                     } else {
-                        callback('atualizado', change.doc.data(), change.doc.id);
+                        mudancas.push({ tipo: 'atualizado', ticket: change.doc.data() });
                     }
                 });
+                if (mudancas.length > 0) callback(mudancas);
             }, (erro) => console.error('Erro na observação dos tickets Magalu:', erro));
         };
 
