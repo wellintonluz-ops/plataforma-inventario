@@ -4074,6 +4074,7 @@
 
     <script>
         const CHAVE_STORAGE = 'INV_CHAPA_DB_V3_CLEAN';
+        const CHAVE_STORAGE_TICKETS = 'INV_CHAPA_TICKETS_V1'; // separado do blob principal: pode ter fotos grandes em base64
         const CHAVE_SESSION = 'INV_CHAPA_SESSION_V1';
 
         const TODAS_PERMISSOES = [
@@ -4137,6 +4138,22 @@
         if (!state.magaluTickets) state.magaluTickets = [];
         if (!state.treinamentos) state.treinamentos = [];
 
+        // Tickets Magalu ficam numa chave própria do localStorage — podem ter fotos grandes em
+        // base64, e não faz sentido reescrever tudo isso toda vez que qualquer outra coisa do
+        // sistema é salva (era isso que estava deixando o carregamento pesado).
+        try {
+            const _rawTickets = localStorage.getItem(CHAVE_STORAGE_TICKETS);
+            if (_rawTickets && _rawTickets.length > 0) {
+                const _tickets = JSON.parse(_rawTickets);
+                if (Array.isArray(_tickets)) state.magaluTickets = _tickets;
+            } else if (state.magaluTickets && state.magaluTickets.length > 0) {
+                // Migração de versão antiga: tickets ainda estavam dentro do blob principal
+                localStorage.setItem(CHAVE_STORAGE_TICKETS, JSON.stringify(state.magaluTickets));
+            }
+        } catch (e) {
+            console.warn('Dados de tickets do localStorage corrompidos, ignorando cache local.', e);
+        }
+
         // Garante que os ADMs master sempre existam. O Google (etapa 1) só confirma que a pessoa
         // tem uma conta @grupotbx.com.br; o acesso ao sistema em si continua exigindo login/senha
         // cadastrados aqui (etapa 2), gerenciáveis em "Gerenciar Usuários".
@@ -4165,7 +4182,7 @@
                 if (!existente.senha) { existente.senha = a.senha; _precisaSalvarUsuarios = true; }
             }
         });
-        if (_precisaSalvarUsuarios) localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+        if (_precisaSalvarUsuarios) persistirEstadoLocal();
 
         let usuarioLogado = null;
         let invPaleteAtual = null;
@@ -4186,6 +4203,7 @@
         let mgtAutorInteracaoSelecionado = 'TBX';
         let mgtImagemInteracaoBase64 = '';
         let mgtMensagemIdEmEdicao = null;
+        let mgtCarregandoMidiaEdicao = false; // evita salvar (e apagar sem querer) a foto atual enquanto ela ainda carrega
 
         function cleanHeader(h) {
             if (!h) return '';
@@ -4210,8 +4228,44 @@
             return s;
         }
 
+        let _avisouLocalStorageCheio = false;
+
+        // Grava o state no localStorage SEM os tickets Magalu (que ficam em CHAVE_STORAGE_TICKETS —
+        // podem carregar fotos grandes em base64, e não faz sentido reescrever isso a cada save de
+        // qualquer outra parte do sistema). Blindado: se o navegador estiver com o armazenamento local
+        // cheio, avisa uma vez e segue o app funcionando normalmente (a nuvem continua sendo salva).
+        function persistirEstadoLocal() {
+            try {
+                const { magaluTickets, ...estadoSemTickets } = state;
+                localStorage.setItem(CHAVE_STORAGE, JSON.stringify(estadoSemTickets));
+            } catch (e) {
+                console.error('Erro ao salvar localmente (armazenamento do navegador cheio?):', e);
+                if (!_avisouLocalStorageCheio) {
+                    _avisouLocalStorageCheio = true;
+                    showToast('O armazenamento local do navegador está cheio — a cópia local de segurança não foi salva, mas os dados continuam sincronizando normalmente com a nuvem.', 'error');
+                }
+            }
+        }
+
+        // Campos "leves" do ticket (sem fotos nem conversa) — usados na lista, no cache local
+        // e no documento principal do Firestore. As fotos/conversa (pesadas) ficam separadas
+        // e só são buscadas quando alguém abre aquele ticket específico.
+        function _ticketCamposLeves(ticket) {
+            const { imagemPlataforma, timeline, ...leve } = ticket;
+            return leve;
+        }
+
+        function persistirTicketsLocal() {
+            try {
+                const leves = (state.magaluTickets || []).map(_ticketCamposLeves);
+                localStorage.setItem(CHAVE_STORAGE_TICKETS, JSON.stringify(leves));
+            } catch (e) {
+                console.error('Erro ao salvar tickets localmente (armazenamento do navegador cheio?):', e);
+            }
+        }
+
         function saveToStorage() {
-            localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+            persistirEstadoLocal();
             updateMetrics();
             renderAll();
             agendarSyncFirestore();
@@ -4268,16 +4322,38 @@
                 }
             }
 
-            // Tickets Magalu: um documento por ticket (ver comentário acima)
+            // Tickets Magalu: um documento por ticket, com fotos/conversa numa coleção separada
+            // (ver comentário acima da definição de sincronizarMidiaTicketMagalu).
             if (typeof window.firestoreCarregarTickets === 'function') {
                 try {
                     const ticketsNuvem = await window.firestoreCarregarTickets();
                     if (ticketsNuvem.length > 0) {
-                        state.magaluTickets = ticketsNuvem;
+                        // Migração única: tickets salvos antes desta versão podem ainda ter fotos/
+                        // conversa embutidas no documento principal. Move pra coleção de mídia
+                        // separada e limpa o documento principal — deixa os próximos logins rápidos.
+                        const legados = ticketsNuvem.filter(t => t.imagemPlataforma || (t.timeline && t.timeline.length > 0));
+                        if (legados.length > 0 && typeof window.firestoreSalvarMidiaTicket === 'function') {
+                            await Promise.allSettled(legados.map(async t => {
+                                try {
+                                    await window.firestoreSalvarMidiaTicket(t.id, {
+                                        imagemPlataforma: t.imagemPlataforma || '',
+                                        timeline: t.timeline || []
+                                    });
+                                    await window.firestoreSalvarTicket(_ticketCamposLeves(t));
+                                } catch (e) { console.error('Erro ao migrar mídia do ticket:', t.id, e); }
+                            }));
+                        }
+                        state.magaluTickets = ticketsNuvem.map(_ticketCamposLeves);
+                        persistirTicketsLocal();
                     } else if ((state.magaluTickets || []).length > 0) {
-                        // Nuvem vazia mas já existem tickets locais: semeia a nuvem com eles
+                        // Nuvem vazia mas já existem tickets locais: semeia a nuvem com eles (leve + mídia)
                         for (const t of state.magaluTickets) {
-                            try { await window.firestoreSalvarTicket(t); } catch (e) { console.error('Erro ao semear ticket:', t.id, e); }
+                            try {
+                                await window.firestoreSalvarTicket(_ticketCamposLeves(t));
+                                if (t.imagemPlataforma || (t.timeline && t.timeline.length > 0)) {
+                                    await window.firestoreSalvarMidiaTicket(t.id, { imagemPlataforma: t.imagemPlataforma || '', timeline: t.timeline || [] });
+                                }
+                            } catch (e) { console.error('Erro ao semear ticket:', t.id, e); }
                         }
                     }
                 } catch (e) {
@@ -4288,10 +4364,33 @@
 
         function sincronizarTicketMagalu(ticket) {
             if (typeof window.firestoreSalvarTicket !== 'function') return;
-            window.firestoreSalvarTicket(ticket).catch(e => {
+            window.firestoreSalvarTicket(_ticketCamposLeves(ticket)).catch(e => {
                 console.error('Erro ao sincronizar ticket com o Firestore:', e);
-                showToast('Este ticket ficou salvo só neste dispositivo — não sincronizou com a nuvem. Verifique o tamanho das fotos anexadas ou a internet.', 'error');
+                showToast('Este ticket ficou salvo só neste dispositivo — não sincronizou com a nuvem. Verifique a internet.', 'error');
             });
+        }
+
+        function sincronizarMidiaTicketMagalu(ticket) {
+            if (typeof window.firestoreSalvarMidiaTicket !== 'function') return;
+            window.firestoreSalvarMidiaTicket(ticket.id, {
+                imagemPlataforma: ticket.imagemPlataforma || '',
+                timeline: ticket.timeline || []
+            }).catch(e => {
+                console.error('Erro ao sincronizar fotos/conversa do ticket com o Firestore:', e);
+                showToast('As fotos/conversa deste ticket ficaram salvas só neste dispositivo — não sincronizaram com a nuvem. Verifique o tamanho das fotos ou a internet.', 'error');
+            });
+        }
+
+        async function carregarMidiaTicketMagalu(ticket) {
+            if (typeof window.firestoreCarregarMidiaTicket !== 'function') return;
+            try {
+                const midia = await window.firestoreCarregarMidiaTicket(ticket.id);
+                ticket.imagemPlataforma = midia ? (midia.imagemPlataforma || '') : '';
+                ticket.timeline = midia ? (midia.timeline || []) : [];
+            } catch (e) {
+                console.error('Erro ao carregar fotos/conversa do ticket:', ticket.id, e);
+                showToast('Não foi possível carregar as fotos/conversa deste ticket agora. Verifique a internet.', 'error');
+            }
         }
 
         function excluirTicketMagaluDaNuvem(id) {
@@ -4316,7 +4415,7 @@
                         aplicou = true;
                     });
                     if (!aplicou) return;
-                    localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+                    persistirEstadoLocal();
                     updateMetrics();
                     renderAll();
                 });
@@ -4332,7 +4431,7 @@
                             if (idx !== -1) state.magaluTickets[idx] = m.ticket; else state.magaluTickets.unshift(m.ticket);
                         }
                     });
-                    localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+                    persistirTicketsLocal();
                     if (typeof filtrarTicketsMagalu === 'function') filtrarTicketsMagalu();
                 });
             }
@@ -4640,30 +4739,43 @@
             renderAll();
         }
 
+        // Evita reconstruir a tabela de uma aba que não está visível no momento — um salvamento
+        // em qualquer parte do sistema não precisa recalcular as ~20 tabelas de todas as outras
+        // abas, só a que a pessoa está de fato olhando. As demais são recalculadas sozinhas ao
+        // trocar de aba (switchTab já chama renderAll() no final). Falha segura: se o elemento
+        // não existir ainda ou não estiver dentro de uma aba, sempre renderiza (nunca pula por engano).
+        function _abaVisivelPara(elementId) {
+            const el = document.getElementById(elementId);
+            if (!el) return true;
+            const abaContainer = el.closest('.tab-content');
+            if (!abaContainer) return true;
+            return !abaContainer.classList.contains('hidden');
+        }
+
         function renderAll() {
-            renderCatalogoTable();
-            renderGestaoTable();
-            renderConsolidadoTable();
-            renderRelatoriosTable();
-            renderValidacaoTable();
-            renderAjustesTable();
-            renderAjustesInvTable();
-            renderHistoricoAcoes();
-            renderHistoricoPaletes();
-            renderHistoricoEtiquetas();
-            renderInvRealizadosChapas();
-            renderInvRealizadosChapasPalete();
-            renderInvAt();
-            renderInvAtValidacao();
+            if (_abaVisivelPara('catalogo-table-body')) renderCatalogoTable();
+            if (_abaVisivelPara('gestao-table-body')) renderGestaoTable();
+            if (_abaVisivelPara('consolidado-table-body')) renderConsolidadoTable();
+            if (_abaVisivelPara('relatorios-table-body')) renderRelatoriosTable();
+            if (_abaVisivelPara('validacao-cadastro-body')) renderValidacaoTable();
+            if (_abaVisivelPara('ajustes-table-body')) renderAjustesTable();
+            if (_abaVisivelPara('ajustes-inv-table-body')) renderAjustesInvTable();
+            if (_abaVisivelPara('historico-acoes-body')) renderHistoricoAcoes();
+            if (_abaVisivelPara('historico-paletes-body')) renderHistoricoPaletes();
+            if (_abaVisivelPara('historico-etiquetas-body')) renderHistoricoEtiquetas();
+            if (_abaVisivelPara('invreal-chapas-body')) renderInvRealizadosChapas();
+            if (_abaVisivelPara('invreal-chapas-pal-body')) renderInvRealizadosChapasPalete();
+            if (_abaVisivelPara('invat-f-body')) renderInvAt();
+            if (_abaVisivelPara('invat-val-body')) renderInvAtValidacao();
             atualizarBadgeInvAtPend();
-            renderUsuariosTable();
+            if (_abaVisivelPara('usuarios-table-body')) renderUsuariosTable();
             atualizarBadgeDivergencias();
-            renderAnotacoes();
-            renderPosicoesDuplicadasInvAt();
-            renderRNC();
-            renderInspecoesTransferencia();
-            renderizarTicketsMagalu();
-            renderTreinamentos();
+            if (_abaVisivelPara('anotacoes-lista')) renderAnotacoes();
+            if (_abaVisivelPara('invat-posicao-duplicada-body')) renderPosicoesDuplicadasInvAt();
+            if (_abaVisivelPara('rnc-body')) renderRNC();
+            if (_abaVisivelPara('inspecao-transferencia-body')) renderInspecoesTransferencia();
+            if (_abaVisivelPara('mgt-grid')) renderizarTicketsMagalu();
+            if (_abaVisivelPara('treinamentos-body')) renderTreinamentos();
         }
 
         // ── REGISTRO E TRANSFERÊNCIA: INSPEÇÃO DE TRANSFERÊNCIA ──────────
@@ -4926,7 +5038,7 @@
             renderizarTicketsMagalu(filtrados);
         }
 
-        function exibirTicketMagaluCompleto(id) {
+        async function exibirTicketMagaluCompleto(id) {
             const ticket = state.magaluTickets.find(t => String(t.id).trim() === String(id).trim());
             if (!ticket) return;
 
@@ -4936,6 +5048,11 @@
             document.getElementById('mgt-view-dashboard').classList.add('hidden');
             document.getElementById('mgt-view-detalhe').classList.remove('hidden');
 
+            // Mostra o essencial na hora; fotos/conversa (mais pesadas) são buscadas agora, sob demanda
+            _renderizarDetalheTicketMagalu(ticket);
+            const containerImg = document.getElementById('mgt-detalhe-imagem');
+            if (containerImg) containerImg.innerHTML = `<span class="flex items-center gap-1.5 text-slate-400 font-bold"><i class="fa-solid fa-spinner fa-spin"></i> Carregando...</span>`;
+            await carregarMidiaTicketMagalu(ticket);
             _renderizarDetalheTicketMagalu(ticket);
 
             document.getElementById('mgt-btn-editar-detalhe').onclick = () => abrirEditarTicketMagalu(id);
@@ -5011,6 +5128,7 @@
             ticket.status = ticket.status === 'PAGO' ? 'ABERTO' : 'PAGO';
             saveToStorage();
             sincronizarTicketMagalu(ticket);
+            persistirTicketsLocal();
             _renderizarDetalheTicketMagalu(ticket);
             showToast(`Ticket marcado como ${ticket.status}.`, 'success');
         }
@@ -5031,6 +5149,7 @@
             state.magaluTickets = state.magaluTickets.filter(t => String(t.id).trim() !== String(idApagar).trim());
             saveToStorage();
             excluirTicketMagaluDaNuvem(idApagar);
+            persistirTicketsLocal();
 
             if (mgtTicketAtivoId !== null && String(mgtTicketAtivoId).trim() === String(idApagar).trim()) {
                 voltarParaDashboardMagalu();
@@ -5043,6 +5162,7 @@
         }
 
         function abrirModalNovoTicketMagalu() {
+            mgtCarregandoMidiaEdicao = false;
             document.getElementById('mgt-form').reset();
             document.getElementById('mgt-form-id').value = '';
             document.getElementById('mgt-form-titulo').innerText = 'Registrar Novo Ticket';
@@ -5052,7 +5172,7 @@
             document.getElementById('mgt-modal-form').classList.remove('hidden');
         }
 
-        function abrirEditarTicketMagalu(id) {
+        async function abrirEditarTicketMagalu(id) {
             const ticket = state.magaluTickets.find(t => String(t.id).trim() === String(id).trim());
             if (!ticket) return;
 
@@ -5065,16 +5185,7 @@
             document.getElementById('mgt-form-chegada-magalu').value = ticket.chegadaMagalu || '';
             document.getElementById('mgt-form-motivo-divergencia').value = ticket.motivoDivergencia || '';
             document.getElementById('mgt-form-descricao').value = ticket.descricao || '';
-
-            if (ticket.imagemPlataforma) {
-                mgtImagemPlataformaBase64 = ticket.imagemPlataforma;
-                document.getElementById('mgt-form-imagem-preview').src = mgtImagemPlataformaBase64;
-                document.getElementById('mgt-form-imagem-preview-container').classList.remove('hidden');
-                document.getElementById('mgt-form-imagem-preview-container').classList.add('flex');
-                document.getElementById('mgt-form-imagem-nome').innerText = 'Imagem atual mantida';
-            } else {
-                removerImagemPlataformaMagalu();
-            }
+            removerImagemPlataformaMagalu();
 
             const containerEnvios = document.getElementById('mgt-container-envios-form');
             containerEnvios.innerHTML = '';
@@ -5085,6 +5196,18 @@
             }
 
             document.getElementById('mgt-modal-form').classList.remove('hidden');
+
+            // Busca a foto atual (se houver) sob demanda, sem travar a abertura do formulário
+            mgtCarregandoMidiaEdicao = true;
+            await carregarMidiaTicketMagalu(ticket);
+            mgtCarregandoMidiaEdicao = false;
+            if (ticket.imagemPlataforma) {
+                mgtImagemPlataformaBase64 = ticket.imagemPlataforma;
+                document.getElementById('mgt-form-imagem-preview').src = mgtImagemPlataformaBase64;
+                document.getElementById('mgt-form-imagem-preview-container').classList.remove('hidden');
+                document.getElementById('mgt-form-imagem-preview-container').classList.add('flex');
+                document.getElementById('mgt-form-imagem-nome').innerText = 'Imagem atual mantida';
+            }
         }
 
         function fecharModalFormularioTicketMagalu() {
@@ -5183,6 +5306,11 @@
         function salvarTicketMagalu(event) {
             event.preventDefault();
 
+            if (mgtCarregandoMidiaEdicao) {
+                showToast('Aguarde um instante — ainda carregando a imagem atual deste ticket.', 'warning');
+                return;
+            }
+
             const idExistente = document.getElementById('mgt-form-id').value;
             const cod = document.getElementById('mgt-form-cod').value.trim();
             const data = document.getElementById('mgt-form-data').value;
@@ -5245,6 +5373,8 @@
 
             saveToStorage();
             sincronizarTicketMagalu(ticketSalvo);
+            sincronizarMidiaTicketMagalu(ticketSalvo);
+            persistirTicketsLocal();
             fecharModalFormularioTicketMagalu();
 
             if (mgtTicketAtivoId) {
@@ -5310,7 +5440,8 @@
             });
 
             saveToStorage();
-            sincronizarTicketMagalu(ticket);
+            sincronizarMidiaTicketMagalu(ticket);
+            persistirTicketsLocal();
             textoEl.value = '';
             removerAnexoInteracaoMagalu();
             renderizarConversaMagalu(ticket);
@@ -5398,7 +5529,8 @@
             msg.texto = novoTexto;
             mgtMensagemIdEmEdicao = null;
             saveToStorage();
-            sincronizarTicketMagalu(ticket);
+            sincronizarMidiaTicketMagalu(ticket);
+            persistirTicketsLocal();
             renderizarConversaMagalu(ticket);
             showToast('Mensagem atualizada.', 'success');
         }
@@ -5409,7 +5541,8 @@
             if (!confirm('Apagar esta mensagem do histórico?')) return;
             ticket.timeline = (ticket.timeline || []).filter(m => m.id !== id);
             saveToStorage();
-            sincronizarTicketMagalu(ticket);
+            sincronizarMidiaTicketMagalu(ticket);
+            persistirTicketsLocal();
             renderizarConversaMagalu(ticket);
             showToast('Mensagem apagada.', 'info');
         }
@@ -5760,7 +5893,7 @@
         let fluxoPlayConcluidos       = new Set();
 
         function fluxoPersist() {
-            localStorage.setItem(CHAVE_STORAGE, JSON.stringify(state));
+            persistirEstadoLocal();
             agendarSyncFirestore();
         }
 
@@ -11138,7 +11271,7 @@
             getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
         } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
         import {
-            getFirestore, collection, doc, getDocs, writeBatch, onSnapshot, serverTimestamp, setDoc, deleteDoc
+            getFirestore, collection, doc, getDoc, getDocs, writeBatch, onSnapshot, serverTimestamp, setDoc, deleteDoc
         } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 
         const firebaseConfig = {
@@ -11196,10 +11329,12 @@
             }, (erro) => console.error('Erro na observação do Firestore:', erro));
         };
 
-        // ── Tickets Magalu: um documento por ticket (podem ter fotos em base64 anexadas,
-        // então ficam fora do documento único acima para não estourar o limite de 1MB
-        // e não travar a sincronização do resto do sistema) ──
+        // ── Tickets Magalu: um documento LEVE por ticket (cod, status, envios, etc. — usado na
+        // lista e no cache local) + um documento de MÍDIA separado por ticket (fotos em base64 +
+        // conversa) numa coleção própria. Assim a lista carrega rápido mesmo com muitos tickets;
+        // fotos/conversa só são baixadas quando alguém abre aquele ticket específico. ──
         const COLECAO_TICKETS = 'depositoChapas_estado_magaluTickets';
+        const COLECAO_TICKETS_MIDIA = 'depositoChapas_estado_magaluTicketsMidia';
 
         window.firestoreCarregarTickets = async function () {
             const snap = await getDocs(collection(db, COLECAO_TICKETS));
@@ -11212,8 +11347,21 @@
             await setDoc(doc(db, COLECAO_TICKETS, String(ticket.id)), { ...ticket, atualizadoEm: serverTimestamp() });
         };
 
+        window.firestoreCarregarMidiaTicket = async function (id) {
+            const ref = doc(db, COLECAO_TICKETS_MIDIA, String(id));
+            const snap = await getDoc(ref);
+            return snap.exists() ? snap.data() : null;
+        };
+
+        window.firestoreSalvarMidiaTicket = async function (id, midia) {
+            await setDoc(doc(db, COLECAO_TICKETS_MIDIA, String(id)), { ...midia, atualizadoEm: serverTimestamp() });
+        };
+
         window.firestoreExcluirTicket = async function (id) {
-            await deleteDoc(doc(db, COLECAO_TICKETS, String(id)));
+            await Promise.all([
+                deleteDoc(doc(db, COLECAO_TICKETS, String(id))),
+                deleteDoc(doc(db, COLECAO_TICKETS_MIDIA, String(id))).catch(() => {}) // pode não existir (ticket sem foto/conversa)
+            ]);
         };
 
         window.firestoreObservarTickets = function (callback) {
