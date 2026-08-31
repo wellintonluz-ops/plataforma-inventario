@@ -4075,6 +4075,9 @@
     <script>
         const CHAVE_STORAGE = 'INV_CHAPA_DB_V3_CLEAN';
         const CHAVE_STORAGE_TICKETS = 'INV_CHAPA_TICKETS_V1'; // separado do blob principal: pode ter fotos grandes em base64
+        const CHAVE_STORAGE_HISTORICO = 'INV_CHAPA_HISTORICO_V1'; // log que só cresce (uma ação por gravação)
+        const CHAVE_STORAGE_INVENTARIOS = 'INV_CHAPA_INVENTARIOS_V1'; // log que só cresce (um registro por inventário concluído)
+        const CHAVE_STORAGE_RELATORIOS = 'INV_CHAPA_RELATORIOS_V1'; // log que só cresce (um CSV por reset/conclusão)
         const CHAVE_SESSION = 'INV_CHAPA_SESSION_V1';
 
         const TODAS_PERMISSOES = [
@@ -4138,21 +4141,28 @@
         if (!state.magaluTickets) state.magaluTickets = [];
         if (!state.treinamentos) state.treinamentos = [];
 
-        // Tickets Magalu ficam numa chave própria do localStorage — podem ter fotos grandes em
-        // base64, e não faz sentido reescrever tudo isso toda vez que qualquer outra coisa do
-        // sistema é salva (era isso que estava deixando o carregamento pesado).
-        try {
-            const _rawTickets = localStorage.getItem(CHAVE_STORAGE_TICKETS);
-            if (_rawTickets && _rawTickets.length > 0) {
-                const _tickets = JSON.parse(_rawTickets);
-                if (Array.isArray(_tickets)) state.magaluTickets = _tickets;
-            } else if (state.magaluTickets && state.magaluTickets.length > 0) {
-                // Migração de versão antiga: tickets ainda estavam dentro do blob principal
-                localStorage.setItem(CHAVE_STORAGE_TICKETS, JSON.stringify(state.magaluTickets));
+        // Alguns dados são "logs que só crescem" (tickets com fotos, histórico de ações, inventários
+        // concluídos, relatórios CSV) — ficam em chaves próprias do localStorage em vez do blob
+        // principal, porque senão qualquer salvamento no sistema precisaria reescrever tudo isso de
+        // novo (era isso que estava deixando o carregamento pesado / travando o navegador).
+        function _migrarParaChaveLocalSeparada(chaveLocalStorage, chaveEstado) {
+            try {
+                const _raw = localStorage.getItem(chaveLocalStorage);
+                if (_raw && _raw.length > 0) {
+                    const _dados = JSON.parse(_raw);
+                    if (Array.isArray(_dados)) state[chaveEstado] = _dados;
+                } else if (state[chaveEstado] && state[chaveEstado].length > 0) {
+                    // Migração de versão antiga: esses dados ainda estavam dentro do blob principal
+                    localStorage.setItem(chaveLocalStorage, JSON.stringify(state[chaveEstado]));
+                }
+            } catch (e) {
+                console.warn(`Dados de ${chaveEstado} do localStorage corrompidos, ignorando cache local.`, e);
             }
-        } catch (e) {
-            console.warn('Dados de tickets do localStorage corrompidos, ignorando cache local.', e);
         }
+        _migrarParaChaveLocalSeparada(CHAVE_STORAGE_TICKETS, 'magaluTickets');
+        _migrarParaChaveLocalSeparada(CHAVE_STORAGE_HISTORICO, 'historicoAcoes');
+        _migrarParaChaveLocalSeparada(CHAVE_STORAGE_INVENTARIOS, 'inventarios');
+        _migrarParaChaveLocalSeparada(CHAVE_STORAGE_RELATORIOS, 'relatorios');
 
         // Garante que os ADMs master sempre existam. O Google (etapa 1) só confirma que a pessoa
         // tem uma conta @grupotbx.com.br; o acesso ao sistema em si continua exigindo login/senha
@@ -4230,14 +4240,15 @@
 
         let _avisouLocalStorageCheio = false;
 
-        // Grava o state no localStorage SEM os tickets Magalu (que ficam em CHAVE_STORAGE_TICKETS —
-        // podem carregar fotos grandes em base64, e não faz sentido reescrever isso a cada save de
-        // qualquer outra parte do sistema). Blindado: se o navegador estiver com o armazenamento local
-        // cheio, avisa uma vez e segue o app funcionando normalmente (a nuvem continua sendo salva).
+        // Grava o state no localStorage SEM os "logs que só crescem" (tickets com fotos,
+        // histórico de ações, inventários concluídos, relatórios) — cada um deles tem sua
+        // própria chave, gravada só quando aquele log específico muda. Blindado: se o
+        // navegador estiver com o armazenamento local cheio, avisa uma vez e segue o app
+        // funcionando normalmente (a nuvem continua sendo salva).
         function persistirEstadoLocal() {
             try {
-                const { magaluTickets, ...estadoSemTickets } = state;
-                localStorage.setItem(CHAVE_STORAGE, JSON.stringify(estadoSemTickets));
+                const { magaluTickets, historicoAcoes, inventarios, relatorios, ...estadoReduzido } = state;
+                localStorage.setItem(CHAVE_STORAGE, JSON.stringify(estadoReduzido));
             } catch (e) {
                 console.error('Erro ao salvar localmente (armazenamento do navegador cheio?):', e);
                 if (!_avisouLocalStorageCheio) {
@@ -4264,6 +4275,21 @@
             }
         }
 
+        // Gravação local dedicada para cada log que só cresce — chamada só quando aquele log
+        // específico muda (não a cada save de qualquer outra coisa do sistema).
+        function _criarPersistirLocal(chaveLocalStorage, chaveEstado, nomeAmigavel) {
+            return function () {
+                try {
+                    localStorage.setItem(chaveLocalStorage, JSON.stringify(state[chaveEstado] || []));
+                } catch (e) {
+                    console.error(`Erro ao salvar ${nomeAmigavel} localmente (armazenamento do navegador cheio?):`, e);
+                }
+            };
+        }
+        const persistirHistoricoLocal = _criarPersistirLocal(CHAVE_STORAGE_HISTORICO, 'historicoAcoes', 'histórico de ações');
+        const persistirInventariosLocal = _criarPersistirLocal(CHAVE_STORAGE_INVENTARIOS, 'inventarios', 'inventários');
+        const persistirRelatoriosLocal = _criarPersistirLocal(CHAVE_STORAGE_RELATORIOS, 'relatorios', 'relatórios');
+
         function saveToStorage() {
             persistirEstadoLocal();
             updateMetrics();
@@ -4278,14 +4304,18 @@
         // (ele cuida só da comunicação com o Firebase; aqui é que decidimos o que
         // fazer com os dados, mantendo `state` como a única fonte da verdade em memória).
         //
-        // IMPORTANTE: 'magaluTickets' NÃO entra nesta lista — cada ticket pode ter fotos em
-        // base64 anexadas (da plataforma e das conversas), então em vez de ficar dentro de
-        // um único documento (limite de 1MB no Firestore, e se estourasse travava a
-        // sincronização de TODO o resto do sistema), cada ticket agora tem seu próprio
-        // documento na coleção `depositoChapas_estado_magaluTickets`.
+        // IMPORTANTE: 'magaluTickets', 'historicoAcoes', 'inventarios' e 'relatorios' NÃO entram
+        // nesta lista — são "logs que só crescem" (tickets podem ter fotos; os outros três crescem
+        // a cada ação/inventário/reset, sem fim). Se qualquer um deles passasse de 1MB dentro do
+        // documento único, a gravação em lote falhava por inteiro — e como o lote é sempre gravado
+        // junto, isso travava a sincronização de TODO o resto do sistema (catálogo, paletes etc.),
+        // não só daquele log. Cada um desses quatro agora tem seu próprio documento por registro,
+        // em coleções próprias (`depositoChapas_estado_magaluTickets`,
+        // `depositoChapas_estado_historicoAcoes`, `depositoChapas_estado_inventarios`,
+        // `depositoChapas_estado_relatorios`).
         const CHAVES_ESTADO_FIRESTORE = [
-            'catalog', 'pallets', 'relatorios', 'divergencias', 'usuarios', 'ajustes',
-            'inventarios', 'historicoAcoes', 'invAtFisico', 'invAtSistema', 'invAtPendentes',
+            'catalog', 'pallets', 'divergencias', 'usuarios', 'ajustes',
+            'invAtFisico', 'invAtSistema', 'invAtPendentes',
             'anotacoes', 'invAtPosicoesDuplicadas', 'rnc', 'inspecoesTransferencia', 'treinamentos'
         ];
 
@@ -4304,8 +4334,9 @@
         }
 
         async function hidratarEstadoDoFirestore() {
+            let nuvem = {};
             if (typeof window.firestoreCarregarTudo === 'function') {
-                const nuvem = await window.firestoreCarregarTudo();
+                nuvem = await window.firestoreCarregarTudo();
                 const faltantes = [];
                 CHAVES_ESTADO_FIRESTORE.forEach(chave => {
                     if (nuvem[chave] && Array.isArray(nuvem[chave].dados)) {
@@ -4360,6 +4391,39 @@
                     console.error('Erro ao carregar tickets Magalu do Firestore:', e);
                 }
             }
+
+            // Logs que só crescem (histórico de ações, inventários, relatórios): um documento por
+            // registro, cada um em sua própria coleção — ver comentário de CHAVES_ESTADO_FIRESTORE.
+            for (const cfg of LOGS_REGISTRO) {
+                const primitivas = window[cfg.primitivas];
+                if (!primitivas || typeof primitivas.carregar !== 'function') continue;
+                try {
+                    const registrosNuvem = await primitivas.carregar();
+                    // Migração única: se ainda existir o documento único antigo (de antes desta
+                    // atualização) com dados desse log, migra os registros que faltam.
+                    const legado = (nuvem[cfg.chaveEstado] && Array.isArray(nuvem[cfg.chaveEstado].dados)) ? nuvem[cfg.chaveEstado].dados : [];
+                    if (legado.length > 0) {
+                        const idsJaNaNuvem = new Set(registrosNuvem.map(r => String(r.id)));
+                        const paraMigrar = legado.filter(r => r && r.id && !idsJaNaNuvem.has(String(r.id)));
+                        if (paraMigrar.length > 0) {
+                            await Promise.allSettled(paraMigrar.map(r => primitivas.salvar(r).catch(e => console.error(`Erro ao migrar ${cfg.nome}:`, r.id, e))));
+                            registrosNuvem.push(...paraMigrar);
+                        }
+                    }
+
+                    if (registrosNuvem.length > 0) {
+                        state[cfg.chaveEstado] = registrosNuvem.sort((a, b) => new Date(b.data) - new Date(a.data));
+                        cfg.persistirLocal();
+                    } else if ((state[cfg.chaveEstado] || []).length > 0) {
+                        // Nuvem vazia mas já existem registros locais: semeia a nuvem com eles
+                        await Promise.allSettled(state[cfg.chaveEstado].map(r =>
+                            primitivas.salvar(r).catch(e => console.error(`Erro ao semear ${cfg.nome}:`, r.id, e))
+                        ));
+                    }
+                } catch (e) {
+                    console.error(`Erro ao carregar ${cfg.nome} do Firestore:`, e);
+                }
+            }
         }
 
         function sincronizarTicketMagalu(ticket) {
@@ -4398,8 +4462,28 @@
             window.firestoreExcluirTicket(id).catch(e => console.error('Erro ao excluir ticket na nuvem:', e));
         }
 
+        // ── LOGS QUE SÓ CRESCEM: histórico de ações, inventários concluídos, relatórios ──────
+        // Cada um tem sua própria coleção no Firestore, com um documento por registro — nunca
+        // um documento único acumulando tudo (ver comentário de CHAVES_ESTADO_FIRESTORE acima).
+        const LOGS_REGISTRO = [
+            { chaveEstado: 'historicoAcoes', primitivas: 'firestoreHistoricoAcoes', persistirLocal: () => persistirHistoricoLocal(), nome: 'histórico de ações' },
+            { chaveEstado: 'inventarios',    primitivas: 'firestoreInventarios',    persistirLocal: () => persistirInventariosLocal(), nome: 'inventário' },
+            { chaveEstado: 'relatorios',     primitivas: 'firestoreRelatorios',     persistirLocal: () => persistirRelatoriosLocal(), nome: 'relatório' }
+        ];
+
+        function sincronizarRegistro(chaveEstado, registro) {
+            const config = LOGS_REGISTRO.find(l => l.chaveEstado === chaveEstado);
+            const primitivas = config && window[config.primitivas];
+            if (!primitivas || typeof primitivas.salvar !== 'function' || !registro) return;
+            primitivas.salvar(registro).catch(e => {
+                console.error(`Erro ao sincronizar ${config.nome} com o Firestore:`, e);
+                showToast(`Este registro de ${config.nome} ficou salvo só neste dispositivo — não sincronizou com a nuvem. Verifique a internet.`, 'error');
+            });
+        }
+
         let _unsubFirestore = null;
         let _unsubFirestoreTickets = null;
+        let _unsubsLogsRegistro = [];
         function iniciarObservacaoFirestore() {
             let _primeiraEntregaEstado = true;
             let _primeiraEntregaTickets = true;
@@ -4435,10 +4519,31 @@
                     if (typeof filtrarTicketsMagalu === 'function') filtrarTicketsMagalu();
                 });
             }
+            if (_unsubsLogsRegistro.length === 0) {
+                LOGS_REGISTRO.forEach(cfg => {
+                    const primitivas = window[cfg.primitivas];
+                    if (!primitivas || typeof primitivas.observar !== 'function') return;
+                    let primeiraEntrega = true;
+                    const unsub = primitivas.observar((registros) => {
+                        if (primeiraEntrega) { primeiraEntrega = false; return; }
+                        registros.forEach(r => {
+                            const lista = state[cfg.chaveEstado];
+                            const idx = lista.findIndex(x => String(x.id) === String(r.id));
+                            if (idx !== -1) lista[idx] = r; else lista.unshift(r);
+                        });
+                        cfg.persistirLocal();
+                        updateMetrics();
+                        renderAll();
+                    });
+                    if (unsub) _unsubsLogsRegistro.push(unsub);
+                });
+            }
         }
         function pararObservacaoFirestore() {
             if (_unsubFirestore) { _unsubFirestore(); _unsubFirestore = null; }
             if (_unsubFirestoreTickets) { _unsubFirestoreTickets(); _unsubFirestoreTickets = null; }
+            _unsubsLogsRegistro.forEach(unsub => unsub());
+            _unsubsLogsRegistro = [];
         }
 
         function garantirAdminsMaster() {
@@ -7030,6 +7135,8 @@
             registrarAcao('Saída', 'Reset do catálogo SKU', '—', '—', `${state.catalog.length} SKUs removidos. Backup: ${nomeArquivo}`);
             state.catalog = [];
             saveToStorage();
+            persistirRelatoriosLocal();
+            sincronizarRegistro('relatorios', state.relatorios[0]);
             resetFormCatalogo();
             renderAll();
             updateMetrics();
@@ -7235,6 +7342,8 @@
             registrarAcao('Saída', 'Reset de paletes', '—', '—', `${state.pallets.length} paletes removidos. Backup: ${nomeArquivo}`);
             state.pallets = [];
             saveToStorage();
+            persistirRelatoriosLocal();
+            sincronizarRegistro('relatorios', state.relatorios[0]);
             resetFormCadastro();
             renderAll();
             updateMetrics();
@@ -8403,6 +8512,10 @@
             });
             registrarAcao('Inventário', 'Concluiu inventário', '—', '—', `${invComparacaoDados.length} SKUs | ${divergentes.length} divergência(s)`);
             saveToStorage();
+            persistirInventariosLocal();
+            sincronizarRegistro('inventarios', state.inventarios[0]);
+            persistirRelatoriosLocal();
+            sincronizarRegistro('relatorios', state.relatorios[0]);
             atualizarBadgeDivergencias();
             atualizarBadgeInvAtPend();
             renderInvAtValidacao();
@@ -10246,6 +10359,8 @@
                 detalhes: detalhes || ''
             });
             saveToStorage();
+            persistirHistoricoLocal();
+            sincronizarRegistro('historicoAcoes', state.historicoAcoes[0]);
         }
 
         const TIPO_COLORS = {
@@ -11378,6 +11493,37 @@
                 if (mudancas.length > 0) callback(mudancas);
             }, (erro) => console.error('Erro na observação dos tickets Magalu:', erro));
         };
+
+        // ── Logs que só crescem (histórico de ações, inventários concluídos, relatórios) ──
+        // Um documento por registro numa coleção própria — nunca tudo acumulado num documento
+        // único, que tem limite de 1MB e travaria a sincronização do resto do sistema se
+        // estourasse (ver mesmo raciocínio usado para os tickets acima).
+        function criarColecaoRegistros(nomeColecao) {
+            return {
+                carregar: async function () {
+                    const snap = await getDocs(collection(db, nomeColecao));
+                    const registros = [];
+                    snap.forEach(d => registros.push(d.data()));
+                    return registros;
+                },
+                salvar: async function (registro) {
+                    await setDoc(doc(db, nomeColecao, String(registro.id)), { ...registro, atualizadoEm: serverTimestamp() });
+                },
+                observar: function (callback) {
+                    return onSnapshot(collection(db, nomeColecao), (snapshot) => {
+                        if (snapshot.metadata.hasPendingWrites) return;
+                        const registros = [];
+                        snapshot.docChanges().forEach(change => {
+                            if (change.type !== 'removed') registros.push(change.doc.data());
+                        });
+                        if (registros.length > 0) callback(registros);
+                    }, (erro) => console.error(`Erro na observação de ${nomeColecao}:`, erro));
+                }
+            };
+        }
+        window.firestoreHistoricoAcoes = criarColecaoRegistros('depositoChapas_estado_historicoAcoes');
+        window.firestoreInventarios = criarColecaoRegistros('depositoChapas_estado_inventarios');
+        window.firestoreRelatorios = criarColecaoRegistros('depositoChapas_estado_relatorios');
 
         function emailPermitido(email) {
             return !!email && email.toLowerCase().endsWith('@' + DOMINIO_PERMITIDO);
